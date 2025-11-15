@@ -17,6 +17,8 @@ rules follow the specifications provided in the project documentation:
   original currency is already USD, the value is used directly.
 * The resulting sales table also includes the customer region obtained by joining
   the sales table and the customer region table on the "售达方" column.
+* Additionally, the sales table gains a USD version of the "实际开票金额" column by
+  converting the original value using the currency-specific exchange rate.
 
 The main entry point is :func:`augment_sales_with_costs`, which accepts either file
 paths to the required workbooks or already loaded ``pandas.DataFrame`` objects.
@@ -88,6 +90,55 @@ def _normalise_material_values(series: pd.Series) -> pd.Series:
     """Return material codes as stripped strings while preserving missing values."""
 
     return series.astype("string").str.strip()
+
+
+def _convert_amount_column_to_usd(
+    df: pd.DataFrame,
+    fx_rates: pd.DataFrame,
+    amount_column: str,
+    currency_column: str,
+    result_column: str,
+) -> pd.DataFrame:
+    """Return *df* with *result_column* holding the USD value of *amount_column*."""
+
+    if amount_column not in df.columns:
+        raise KeyError(f"销售订单明细表缺少列: {amount_column}")
+    if currency_column not in df.columns:
+        raise KeyError(f"销售订单明细表缺少列: {currency_column}")
+    missing_fx_cols = {"币种", "汇率"} - set(fx_rates.columns)
+    if missing_fx_cols:
+        raise KeyError(
+            "汇率表缺少列: {}".format(", ".join(sorted(missing_fx_cols)))
+        )
+
+    fx_series = (
+        fx_rates[["币种", "汇率"]]
+        .dropna(subset=["币种", "汇率"])
+        .set_index("币种")["汇率"].astype(float)
+    )
+
+    result = df.copy()
+    currencies = result[currency_column].astype("string").str.strip()
+    rates = currencies.map(fx_series)
+
+    missing_currencies = currencies[rates.isna() & currencies.notna()].unique()
+    if len(missing_currencies) > 0:
+        raise ValueError(
+            "汇率表缺少以下币种的汇率: {}".format(", ".join(map(str, missing_currencies)))
+        )
+
+    zero_rate_currencies = currencies[(rates == 0) & currencies.notna()].unique()
+    if len(zero_rate_currencies) > 0:
+        raise ValueError(
+            "以下币种的汇率为0，无法换算USD: {}".format(
+                ", ".join(map(str, zero_rate_currencies))
+            )
+        )
+
+    amounts = pd.to_numeric(result[amount_column], errors="coerce")
+    usd_values = amounts / rates
+    result[result_column] = usd_values
+    return result
 
 
 def _normalise_purchase_prices(
@@ -245,6 +296,9 @@ def augment_sales_with_costs(
     sales = sales.copy()
     sales["物料编码"] = _normalise_material_values(sales["物料编码"])
     sales["创建日期"] = _ensure_datetime(sales, "创建日期")
+    sales = _convert_amount_column_to_usd(
+        sales, fx_rates, "实际开票金额", "币种", "实际开票金额USD"
+    )
 
     purchases = _apply_column_aliases(
         purchases,
